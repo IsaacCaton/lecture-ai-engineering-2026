@@ -3,6 +3,7 @@
 import argparse
 import json
 import math
+import os
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -124,8 +125,25 @@ def open_index(path: Path):
         db.close()
 
 
-def search(query: str) -> list[dict]:
-    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+def _with_neighbor_pages(hits: list[dict]) -> list[dict]:
+    """検索順位を保ち、同じ資料の前後1ページを末尾に追加する。"""
+    pages = {
+        (page["document_id"], page["page"]): page
+        for page in load_pages(RAG_SOURCE)
+    }
+    seen = {(hit["document_id"], hit["page"]) for hit in hits}
+    results = hits.copy()
+    for hit in hits:
+        for page_number in (hit["page"] - 1, hit["page"] + 1):
+            key = (hit["document_id"], page_number)
+            if key in pages and key not in seen:
+                results.append({**pages[key], "distance": None})
+                seen.add(key)
+    return results
+
+
+def search(query: str, *, include_neighbors: bool | None = None) -> list[dict]:
+    """近いページを最大RAG_TOP_K件返す。AIE_RAG_NEIGHBORS=1で前後も返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
     with open_index(RAG_DB) as db:
@@ -135,7 +153,13 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        hits = [dict(row) for row in rows]
+
+    if include_neighbors is None:
+        include_neighbors = os.getenv("AIE_RAG_NEIGHBORS") == "1"
+    if include_neighbors and hits:
+        return _with_neighbor_pages(hits)
+    return hits
 
 
 def search_graph(query: str) -> dict:
@@ -151,7 +175,8 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    hits = search(query, include_neighbors=False)
+    seeds = [hit for hit in hits if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
